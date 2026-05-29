@@ -20,7 +20,7 @@ When a sales rep updates an account in Dynamics 365, a Power Automate flow calls
 ## Quick start
 
 ```bash
-git clone https://github.com/rafaeder-maiorino/churn-d365.git
+git clone https://github.com/rafaneder-maiorino/churn-d365.git
 cd churn-d365
 python3.11 -m venv .venv
 source .venv/bin/activate
@@ -71,4 +71,4 @@ Most ML tutorials stop at "model.pkl saved". This one connects the dots all the 
 
 ## Author
 
-[Rafael Maiorino](https://github.com/rafaeder-maiorino) — building this as a follow-up to the [FIAP MLE Tech Challenge](https://postech.fiap.com.br/).
+[Rafael Maiorino](https://github.com/rafaneder-maiorino) — building this as a follow-up to the [FIAP MLE Tech Challenge](https://postech.fiap.com.br/).
