@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.python-version
+
+# Data e modelos (não versionar)
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+models/*
+!models/.gitkeep
+
+# MLflow
+mlruns/
+mlartifacts/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Segredos (vamos usar no Bloco 2)
+.env
+*.pem
+secrets/
+
+# IDE / OS
+.vscode/
+.DS_Store
+
+# Testes
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build
+dist/
+build/
