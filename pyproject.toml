@@ -29,6 +29,7 @@ dependencies = [
     "python-dotenv>=1.0",
     # Validação de schema
     "pandera>=0.18",
+    "faker>=24.0",
 ]
 
 [project.optional-dependencies]
