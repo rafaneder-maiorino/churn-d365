@@ -6,10 +6,12 @@ high-level methods for reading data from Dataverse tables.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -205,21 +207,35 @@ class DataverseClient:
     DEFAULT_RETRY_AFTER = 5
 
     def _send_with_retry(
-        self, method: str, url: str, *, json: dict[str, Any], extra_headers: dict[str, str] | None = None
+        self,
+        method: str,
+        url: str,
+        *,
+        json: dict[str, Any] | None = None,
+        data: bytes | str | None = None,
+        content_type: str = "application/json",
+        extra_headers: dict[str, str] | None = None,
+        timeout: int = 60,
     ) -> requests.Response:
         """Send a write request, retrying on HTTP 429 (throttling).
+
+        Pass either ``json`` (a dict, serialised by requests) for a normal
+        JSON write, or ``data`` (raw bytes/str) plus a ``content_type`` for a
+        pre-built body such as a multipart/mixed $batch payload.
 
         On a 429 the Retry-After header is honoured (falling back to
         DEFAULT_RETRY_AFTER seconds) and the request is retried up to
         MAX_THROTTLE_RETRIES times. Any other 4xx/5xx raises immediately
         via raise_for_status(); a 429 that survives all retries also raises.
         """
-        headers = {**self._headers(), "Content-Type": "application/json"}
+        headers = {**self._headers(), "Content-Type": content_type}
         if extra_headers:
             headers.update(extra_headers)
 
         for attempt in range(self.MAX_THROTTLE_RETRIES + 1):
-            response = self._session.request(method, url, headers=headers, json=json, timeout=60)
+            response = self._session.request(
+                method, url, headers=headers, json=json, data=data, timeout=timeout
+            )
             if response.status_code == 429 and attempt < self.MAX_THROTTLE_RETRIES:
                 retry_after = response.headers.get("Retry-After")
                 try:
@@ -271,3 +287,254 @@ class DataverseClient:
         """
         url = f"{self._base_url}/{entity_set_name}({record_id})"
         self._send_with_retry("PATCH", url, json=data, extra_headers={"If-Match": "*"})
+
+    # ------------------------------------------------------------------
+    # Batch ($batch) operations
+    # ------------------------------------------------------------------
+    #
+    # Dataverse $batch limits (enforced by the service):
+    #   * Max 1000 operations per change set.
+    #   * Max 16 MB total payload per batch request.
+    #   * A change set is transactional: all operations in it commit together
+    #     or the whole set rolls back (all-or-nothing). One bad row fails the
+    #     entire batch, so callers must be prepared to retry/repair a batch.
+
+    MAX_BATCH_OPERATIONS = 1000
+    MAX_BATCH_PAYLOAD_BYTES = 16 * 1024 * 1024
+    BATCH_TIMEOUT = 600
+
+    def create_records_batch(
+        self,
+        entity_set_name: str,
+        records: list[dict[str, Any]],
+        max_per_batch: int = 1000,
+    ) -> list[str]:
+        """Create many records via the Dataverse $batch endpoint.
+
+        Records are split into change sets of at most ``max_per_batch`` and each
+        change set is POSTed to ``/api/data/v9.2/$batch`` as a single
+        multipart/mixed request. This collapses N HTTP round-trips into
+        ceil(N / max_per_batch), which is the source of the ~30x speed-up over
+        per-record ``create_record`` calls.
+
+        Dataverse $batch limits (enforced by the service):
+          * Max 1000 operations per change set (hence the ``max_per_batch`` cap).
+          * Max 16 MB total payload per batch request.
+          * A change set is transactional — all-or-nothing. If any single
+            operation fails, the *entire* change set is rolled back and this
+            method raises; none of that batch's records are created.
+
+        Args:
+            entity_set_name: Plural API name of the table (e.g. 'accounts').
+            records: List of attribute payloads (column logical name -> value).
+            max_per_batch: Operations per change set (1..1000).
+
+        Returns:
+            The created record GUIDs, in the same order as ``records``.
+        """
+        if not 1 <= max_per_batch <= self.MAX_BATCH_OPERATIONS:
+            raise ValueError(
+                f"max_per_batch must be between 1 and {self.MAX_BATCH_OPERATIONS}"
+            )
+        url = f"{self._base_url}/{entity_set_name}"
+        ids: list[str] = []
+        for start in range(0, len(records), max_per_batch):
+            chunk = records[start : start + max_per_batch]
+            operations = [{"method": "POST", "url": url, "payload": rec} for rec in chunk]
+            ops = self._execute_changeset(operations, expected=len(chunk))
+            for i, op in enumerate(ops):
+                if op["entity_id"] is None:
+                    raise RuntimeError(
+                        f"Batch create succeeded (status {op['status']}) but no "
+                        f"OData-EntityId/Location was returned for operation {i}"
+                    )
+                ids.append(op["entity_id"])
+        return ids
+
+    def update_records_batch(
+        self,
+        entity_set_name: str,
+        updates: list[tuple[str, dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
+        """Update many records via $batch (PATCH per operation).
+
+        Used for the two-pass statecode pass: after a fast batch insert of
+        Active rows, the churned rows are flipped to Inactive in one or more
+        update batches. Each PATCH carries ``If-Match: *`` so it only ever
+        updates an existing record (never upserts).
+
+        Dataverse $batch limits (enforced by the service):
+          * Max 1000 operations per change set; ``updates`` is chunked
+            automatically at this limit.
+          * Max 16 MB total payload per batch request.
+          * Change sets are transactional — all-or-nothing rollback within a
+            set. A failing PATCH rolls back every other update in its batch and
+            raises.
+
+        Args:
+            entity_set_name: Plural API name of the table (e.g. 'accounts').
+            updates: List of ``(record_id, data)`` pairs.
+
+        Returns:
+            One parsed operation result dict per update, in input order. Each
+            has keys ``status``, ``entity_id``, ``ok`` and ``body``.
+        """
+        results: list[dict[str, Any]] = []
+        for start in range(0, len(updates), self.MAX_BATCH_OPERATIONS):
+            chunk = updates[start : start + self.MAX_BATCH_OPERATIONS]
+            operations = [
+                {
+                    "method": "PATCH",
+                    "url": f"{self._base_url}/{entity_set_name}({record_id})",
+                    "payload": data,
+                    "headers": {"If-Match": "*"},
+                }
+                for record_id, data in chunk
+            ]
+            results.extend(self._execute_changeset(operations, expected=len(chunk)))
+        return results
+
+    def _execute_changeset(
+        self, operations: list[dict[str, Any]], expected: int
+    ) -> list[dict[str, Any]]:
+        """Build one change set, POST it to $batch, and return parsed results.
+
+        Raises RuntimeError if any operation failed (the whole change set then
+        rolled back) or if the number of responses doesn't match ``expected``.
+        """
+        batch_id = f"batch_{uuid.uuid4().hex}"
+        changeset_id = f"changeset_{uuid.uuid4().hex}"
+        body = self._build_changeset_body(batch_id, changeset_id, operations).encode("utf-8")
+        if len(body) > self.MAX_BATCH_PAYLOAD_BYTES:
+            raise ValueError(
+                f"Batch payload is {len(body)} bytes, over the Dataverse limit "
+                f"of {self.MAX_BATCH_PAYLOAD_BYTES} bytes; lower max_per_batch."
+            )
+        response = self._send_with_retry(
+            "POST",
+            f"{self._base_url}/$batch",
+            data=body,
+            content_type=f"multipart/mixed; boundary={batch_id}",
+            timeout=self.BATCH_TIMEOUT,
+        )
+        ops = self._parse_batch_response(response)
+        failed = [op for op in ops if not op["ok"]]
+        if failed or len(ops) != expected:
+            if failed:
+                detail = f"HTTP {failed[0]['status']}: {failed[0]['body'][:300]}"
+            else:
+                detail = f"expected {expected} responses but parsed {len(ops)}"
+            raise RuntimeError(
+                "Batch change set failed and was rolled back (transactional). "
+                f"First error: {detail}"
+            )
+        return ops
+
+    @staticmethod
+    def _build_changeset_body(
+        batch_id: str, changeset_id: str, operations: list[dict[str, Any]]
+    ) -> str:
+        """Render a multipart/mixed body with a single change set.
+
+        Each operation is a dict with ``method``, ``url``, ``payload`` and an
+        optional ``headers`` dict. Content-IDs are assigned 1..N. CRLF line
+        endings are used as required by the MIME multipart spec.
+        """
+        lines: list[str] = [
+            f"--{batch_id}",
+            f"Content-Type: multipart/mixed; boundary={changeset_id}",
+            "",
+        ]
+        for content_id, op in enumerate(operations, start=1):
+            lines += [
+                f"--{changeset_id}",
+                "Content-Type: application/http",
+                "Content-Transfer-Encoding: binary",
+                f"Content-ID: {content_id}",
+                "",
+                f"{op['method']} {op['url']} HTTP/1.1",
+                "Content-Type: application/json; type=entry",
+            ]
+            for header_key, header_val in op.get("headers", {}).items():
+                lines.append(f"{header_key}: {header_val}")
+            lines += ["", json.dumps(op["payload"]), ""]
+        lines += [f"--{changeset_id}--", f"--{batch_id}--", ""]
+        return "\r\n".join(lines)
+
+    def _parse_batch_response(self, response: requests.Response) -> list[dict[str, Any]]:
+        """Extract one result dict per operation from a $batch response.
+
+        The response is multipart/mixed; a change set's responses are nested in
+        a further multipart/mixed part, so parsing recurses. Each leaf is an
+        ``application/http`` part wrapping a raw HTTP response.
+
+        Returns dicts with keys ``status`` (int), ``entity_id`` (created GUID
+        from the OData-EntityId/Location header, or None), ``ok`` (2xx) and
+        ``body`` (the raw inner HTTP response text).
+        """
+        results: list[dict[str, Any]] = []
+        boundary = self._extract_boundary(response.headers.get("Content-Type", ""))
+        if boundary:
+            self._collect_operations(response.text, boundary, results)
+        return results
+
+    def _collect_operations(
+        self, body: str, boundary: str, results: list[dict[str, Any]]
+    ) -> None:
+        """Walk multipart parts, recursing into nested change-set responses."""
+        for part in self._split_multipart(body, boundary):
+            part = part.lstrip("\r\n")
+            if "\r\n\r\n" in part:
+                raw_headers, part_body = part.split("\r\n\r\n", 1)
+            elif "\n\n" in part:
+                raw_headers, part_body = part.split("\n\n", 1)
+            else:
+                continue
+            lowered = raw_headers.lower()
+            if "multipart/mixed" in lowered:
+                nested = self._extract_boundary(raw_headers)
+                if nested:
+                    self._collect_operations(part_body, nested, results)
+            elif "application/http" in lowered:
+                results.append(self._parse_http_part(part_body))
+
+    @staticmethod
+    def _split_multipart(body: str, boundary: str) -> list[str]:
+        """Split a multipart body into its parts, dropping the closing epilogue."""
+        parts: list[str] = []
+        for segment in body.split(f"--{boundary}")[1:]:
+            if segment.lstrip().startswith("--"):  # closing delimiter: --boundary--
+                break
+            parts.append(segment)
+        return parts
+
+    @staticmethod
+    def _parse_http_part(http_text: str) -> dict[str, Any]:
+        """Parse one inner HTTP response (status line + headers) from a part."""
+        text = http_text.lstrip("\r\n")
+        lines = text.splitlines()
+        status = 0
+        entity_id: str | None = None
+        if lines:
+            status_match = re.match(r"HTTP/\d\.\d\s+(\d+)", lines[0].strip())
+            if status_match:
+                status = int(status_match.group(1))
+        for line in lines[1:]:
+            if not line.strip():
+                break  # blank line ends the header block
+            key, _, value = line.partition(":")
+            if key.strip().lower() in ("odata-entityid", "location"):
+                guid = re.search(r"\(([0-9a-fA-F-]{36})\)", value)
+                entity_id = guid.group(1) if guid else value.strip()
+        return {
+            "status": status,
+            "entity_id": entity_id,
+            "ok": 200 <= status < 300,
+            "body": text,
+        }
+
+    @staticmethod
+    def _extract_boundary(content_type: str) -> str | None:
+        """Pull the boundary token out of a multipart Content-Type header."""
+        match = re.search(r'boundary="?([^";\s]+)"?', content_type)
+        return match.group(1) if match else None
