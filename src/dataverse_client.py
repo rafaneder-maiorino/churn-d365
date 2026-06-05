@@ -14,7 +14,7 @@ from typing import Any
 
 import pandas as pd
 import requests
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 from msal import ConfidentialClientApplication
 
 logger = logging.getLogger(__name__)
@@ -30,8 +30,20 @@ class DataverseConfig:
     client_secret: str
 
     @classmethod
-    def from_env(cls, env_path: str = ".env") -> "DataverseConfig":
-        """Load configuration from a .env file with explicit path."""
+    def from_env(cls, env_path: str | None = None) -> "DataverseConfig":
+        """Load configuration from a .env file.
+
+        If env_path is None, searches upward from the current working
+        directory for a .env file. This makes the client work from
+        notebooks, scripts, or REPLs anywhere within the project tree.
+        """
+        if env_path is None:
+            env_path = find_dotenv(usecwd=True)
+            if not env_path:
+                raise FileNotFoundError(
+                    ".env file not found. Searched from CWD upward. "
+                    "Pass env_path explicitly to from_env()."
+                )
         load_dotenv(env_path)
         return cls(
             dataverse_url=os.environ["DATAVERSE_URL"],
