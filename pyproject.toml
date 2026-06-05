@@ -30,6 +30,7 @@ dependencies = [
     # Validação de schema
     "pandera>=0.18",
     "faker>=24.0",
+    "tqdm>=4.66",
 ]
 
 [project.optional-dependencies]

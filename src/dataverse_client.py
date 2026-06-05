@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -74,6 +76,8 @@ class DataverseClient:
         self._token: str | None = None
         self._token_expires_at: datetime | None = None
         self._base_url = f"{self.config.dataverse_url}/api/data/{self.API_VERSION}"
+        # Reused for write requests so a bulk load shares one TCP/TLS connection.
+        self._session = requests.Session()
 
     def _get_token(self) -> str:
         """Return a valid access token, refreshing if it's near expiry."""
@@ -192,3 +196,78 @@ class DataverseClient:
             logger.debug("Page fetched, running total: %d records", len(all_records))
 
         return all_records
+
+    # ------------------------------------------------------------------
+    # Write operations
+    # ------------------------------------------------------------------
+
+    MAX_THROTTLE_RETRIES = 5
+    DEFAULT_RETRY_AFTER = 5
+
+    def _send_with_retry(
+        self, method: str, url: str, *, json: dict[str, Any], extra_headers: dict[str, str] | None = None
+    ) -> requests.Response:
+        """Send a write request, retrying on HTTP 429 (throttling).
+
+        On a 429 the Retry-After header is honoured (falling back to
+        DEFAULT_RETRY_AFTER seconds) and the request is retried up to
+        MAX_THROTTLE_RETRIES times. Any other 4xx/5xx raises immediately
+        via raise_for_status(); a 429 that survives all retries also raises.
+        """
+        headers = {**self._headers(), "Content-Type": "application/json"}
+        if extra_headers:
+            headers.update(extra_headers)
+
+        for attempt in range(self.MAX_THROTTLE_RETRIES + 1):
+            response = self._session.request(method, url, headers=headers, json=json, timeout=60)
+            if response.status_code == 429 and attempt < self.MAX_THROTTLE_RETRIES:
+                retry_after = response.headers.get("Retry-After")
+                try:
+                    delay = int(retry_after) if retry_after is not None else self.DEFAULT_RETRY_AFTER
+                except ValueError:
+                    delay = self.DEFAULT_RETRY_AFTER
+                logger.warning(
+                    "Throttled (429) on %s; sleeping %ds then retrying (attempt %d/%d)",
+                    url, delay, attempt + 1, self.MAX_THROTTLE_RETRIES,
+                )
+                time.sleep(delay)
+                # A new token may be needed if the sleep was long; _headers() refreshes it.
+                headers["Authorization"] = self._headers()["Authorization"]
+                continue
+            response.raise_for_status()
+            return response
+
+        # All retries exhausted on 429 — surface the throttling error.
+        response.raise_for_status()
+        return response
+
+    def create_record(self, entity_set_name: str, data: dict[str, Any]) -> str:
+        """Create a record and return its primary-key GUID.
+
+        Args:
+            entity_set_name: Plural API name of the table (e.g. 'accounts').
+            data: Column logical names mapped to values.
+
+        Returns:
+            The new record's GUID, parsed from the OData-EntityId header.
+        """
+        url = f"{self._base_url}/{entity_set_name}"
+        response = self._send_with_retry("POST", url, json=data)
+        entity_id = response.headers.get("OData-EntityId", "")
+        match = re.search(r"\(([0-9a-fA-F-]{36})\)", entity_id)
+        if not match:
+            raise RuntimeError(
+                f"Record created but could not parse id from OData-EntityId: {entity_id!r}"
+            )
+        return match.group(1)
+
+    def update_record(
+        self, entity_set_name: str, record_id: str, data: dict[str, Any]
+    ) -> None:
+        """Update an existing record via PATCH (with the same 429 retry policy).
+
+        If-Match: * is sent so the call only ever updates an existing record
+        and never upserts a new one.
+        """
+        url = f"{self._base_url}/{entity_set_name}({record_id})"
+        self._send_with_retry("PATCH", url, json=data, extra_headers={"If-Match": "*"})
