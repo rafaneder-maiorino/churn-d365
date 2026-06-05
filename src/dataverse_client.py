@@ -108,7 +108,7 @@ class DataverseClient:
         url = f"{self._base_url}/{entity_set}/$count"
         response = requests.get(url, headers=self._headers(accept="text/plain"), timeout=30)
         response.raise_for_status()
-        return int(response.text)
+        return int(response.content.decode("utf-8-sig").strip())
 
     def get_records(
         self,
